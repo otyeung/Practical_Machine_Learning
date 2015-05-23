@@ -1,0 +1,268 @@
+---
+title: "Practical Machine Learning"
+date: "12 May, 2015"
+output: html_document
+---
+
+##Prediction Assignment
+
+###Background
+
+Using devices such as JawboneUp, NikeFuelBand, and Fitbitit is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement - a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it.
+
+In this project, the goal is to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+###Data Preparation
+
+Loading required packages, and enable the cache options.
+
+```{r}
+library(knitr)
+library(ggplot2)
+library(caret)
+library(corrplot)
+library(Rtsne)
+library(xgboost)
+library(stats)
+knitr::opts_chunk$set(cache=TRUE)
+```
+
+Loading the data sets from Internet.
+```{r}
+# URL of the training and testing data
+train.url ="https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+test.url = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+# file names
+train.name = "./data/pml-training.csv"
+test.name = "./data/pml-testing.csv"
+if (!file.exists("./data")) {
+  dir.create("./data")
+}
+if (!file.exists(train.name)) {
+  download.file(train.url, destfile=train.name, method="curl")
+}
+if (!file.exists(test.name)) {
+  download.file(test.url, destfile=test.name, method="curl")
+}
+train = read.csv("./data/pml-training.csv")
+test = read.csv("./data/pml-testing.csv")
+dim(train)
+```
+
+The training set has 19622 obserations and 160 rows.
+
+```{r}
+dim(test)
+```
+
+The test set has 20 obserations and 160 rows.
+
+```{r}
+names(train)
+```
+
+The column name 'classe' is the target outcome variable.
+
+###Data Cleaning
+
+We extract target outcome (the activity quality) from training data, so now the training data contains only the predictors (the activity monitors).
+```{r}
+outcome.org = train[, "classe"]
+outcome = outcome.org 
+levels(outcome)
+```
+The outcome has 5 levels in character format, we convert the outcome to numeric, because XGBoost gradient booster only recognizes numeric data.
+
+```{r}
+num.class = length(levels(outcome))
+levels(outcome) = 1:num.class
+head(outcome)
+```
+
+The outcome is removed from training data. The assignment rubric asks to use data from accelerometers on the belt, forearm, arm, and dumbell, so the features are extracted based on these keywords.
+
+```{r}
+train$classe = NULL
+filter = grepl("belt|arm|dumbell", names(train))
+train = train[, filter]
+test = test[, filter]
+cols.without.na = colSums(is.na(test)) == 0
+#  Instead of less-accurate imputation of missing data, remove all columns with NA values.
+train = train[, cols.without.na]
+test = test[, cols.without.na]
+```
+
+###Data Preprocessing
+
+Based on the principal component analysis PCA, it is important that features have maximum variance for maximum uniqueness, so that each feature is as distant as possible (as orthogonal as possible) from the other features.
+
+```{r}
+zero.var = nearZeroVar(train, saveMetrics=TRUE)
+zero.var
+```
+
+There is no features without variability (all has enough variance). So there is no feature to be removed further.
+
+####Relationship between feature and outcome
+
+Now we plot the relationship between features and outcome. From the plot below, each features has relatively the same distribution among the 5 outcome levels (A, B, C, D, E).
+
+```{r}
+featurePlot(train, outcome.org, "strip")
+```
+
+####Correlation plot
+
+The plot below shows average of correlation is not too high, so I choose to not perform further PCA preprocessing.
+ 
+```{r}
+corrplot.mixed(cor(train), lower="circle", upper="color", 
+               tl.pos="lt", diag="n", order="hclust", hclust.method="complete")
+```
+
+####tSNE plot
+
+A tSNE (t-Distributed Stochastic Neighbor Embedding) visualization is 2D plot of multidimensional features, that is multidimensional reduction into 2D plane. In the tSNE plot below there is no clear separation of clustering of the 5 levels of outcome (A, B, C, D, E). 
+
+```{r}
+tsne = Rtsne(as.matrix(train), check_duplicates=FALSE, pca=TRUE, 
+              perplexity=30, theta=0.5, dims=2)
+```
+
+```{r}
+embedding = as.data.frame(tsne$Y)
+embedding$Class = outcome.org
+g = ggplot(embedding, aes(x=V1, y=V2, color=Class)) +
+  geom_point(size=1.25) +
+  guides(colour=guide_legend(override.aes=list(size=6))) +
+  xlab("") + ylab("") +
+  ggtitle("t-SNE 2D Embedding of 'Classe' Outcome") +
+  theme_light(base_size=20) +
+  theme(axis.text.x=element_blank(),
+        axis.text.y=element_blank())
+print(g)
+```
+
+### Model Building
+
+#### XGBoost data
+XGBoost supports only numeric matrix data. Converting all training, testing and outcome data to matrix.
+
+```{r}
+# convert data to matrix
+train.matrix = as.matrix(train)
+mode(train.matrix) = "numeric"
+test.matrix = as.matrix(test)
+mode(test.matrix) = "numeric"
+# convert outcome from factor to numeric matrix 
+#   xgboost takes multi-labels in [0, numOfClass)
+y = as.matrix(as.integer(outcome)-1)
+```
+
+#### XGBoost parameters
+
+Set XGBoost parameters for cross validation and training.
+Set a multiclass classification objective as the gradient boosting’s learning function.
+Set evaluation metric to merror, multiclass error rate.
+
+```{r}
+# xgboost parameters
+param <- list("objective" = "multi:softprob",  
+              "num_class" = num.class,   
+              "eval_metric" = "merror",   
+              "nthread" = 8,   
+              "max_depth" = 16, 
+              "eta" = 0.3, 
+              "gamma" = 0,   
+              "subsample" = 1,    
+              "colsample_bytree" = 1,  
+              "min_child_weight" = 12 )
+```
+
+####Expected Error Rate and Cross Fold Validation
+
+Expected error rate is less than 1% for a good classification. Do cross validation to estimate the error rate using 4-fold cross validation, with 200 epochs to reach the expected error rate of less than 1%.
+
+```{r, warning=FALSE,error=FALSE,message=FALSE}
+# set random seed, for reproducibility 
+set.seed(1234)
+# k-fold cross validation, with timing
+nround.cv = 200
+bst.cv <- xgb.cv(param=param, data=train.matrix, label=y, 
+              nfold=4, nrounds=nround.cv, prediction=TRUE, verbose=FALSE)
+tail(bst.cv$dt)
+```
+
+From the cross validation, choose index with minimum multiclass error rate.
+Index will be used in the model training to fulfill expected minimum error rate of < 1%.
+
+```{r}
+# index of minimum merror
+min.merror.idx = which.min(bst.cv$dt[, test.merror.mean]) 
+min.merror.idx 
+# minimum merror
+bst.cv$dt[min.merror.idx,]
+```
+
+Best cross-validation’s minimum error rate test.merror.mean is around 0.006 (0.6%), happened at 106th iteration.
+
+####Model training
+
+Fit the XGBoost gradient boosting model on all of the training data.
+
+```{r}
+bst <- xgboost(param=param, data=train.matrix, label=y, 
+                           nrounds=min.merror.idx, verbose=0)
+```
+
+####Predicting the testing data
+
+```{r}
+# xgboost predict test data using the trained model
+pred <- predict(bst, test.matrix)  
+head(pred, 10)  
+```
+
+####Post-processing
+
+Output of prediction is the predicted probability of the 5 levels (columns) of outcome.
+Decode the quantitative 5 levels of outcomes to qualitative letters (A, B, C, D, E).
+
+```{r}
+# decode prediction
+pred = matrix(pred, nrow=num.class, ncol=length(pred)/num.class)
+pred = t(pred)
+pred = max.col(pred, "last")
+pred.char = toupper(letters[pred])
+```
+
+####Feature importance
+
+```{r}
+# get the trained model
+model = xgb.dump(bst, with.stats=TRUE)
+# get the feature real names
+names = dimnames(train.matrix)[[2]]
+# compute feature importance matrix
+importance_matrix = xgb.importance(names, model=bst)
+
+# plot
+gp = xgb.plot.importance(importance_matrix)
+print(gp) 
+```
+
+####Creating submission files
+
+```{r}
+path = "./answer"
+pml_write_files = function(x) {
+    n = length(x)
+    for(i in 1: n) {
+        filename = paste0("problem_id_", i, ".txt")
+        write.table(x[i], file=file.path(path, filename), 
+                    quote=FALSE, row.names=FALSE, col.names=FALSE)
+    }
+}
+pml_write_files(pred.char)
+```
+
